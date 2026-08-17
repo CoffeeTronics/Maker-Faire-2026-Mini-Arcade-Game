@@ -1,210 +1,319 @@
-# code.py - CONTROLLER (MVC pattern)
+# code.py - Unified Game Launcher for PyKit Explorer
+# ==================================================
+# For 64x32 RGB Matrix with Joystick and Buttons
+#
+# Launcher Flow:
+# --------------
+# 1. Initialize shared hardware (RGB Matrix, Joystick, Buttons, Audio)
+# 2. Discover games by scanning /games/ subfolders for BaseGame classes
+# 3. Main loop:
+#    a. Show transition screen with next game name (3 seconds)
+#    b. Create fresh AudioOutput for the game
+#    c. Instantiate game class with shared hardware
+#    d. Call game.setup() to initialize game-specific resources
+#    e. Call game.run() - runs until game over or Button C (Select) press
+#    f. Call game.cleanup() to release game-specific resources
+#    g. Deinit audio to free DAC
+#    h. Cycle to next game and repeat
+#
+# Hardware Resources (shared across all games):
+# ---------------------------------------------
+# - display: MatrixDisplay (64x32 RGB Matrix)
+# - joystick: Joystick (4-direction digital joystick)
+# - buttons: ButtonSet (4 arcade buttons A, B, Select=C, Start=D)
+# - audio: AudioOutput (created fresh for each game)
+# - high_scores: HighScoreManager (NVM persistence)
 
 import sys
-sys.path.append('/API')
+sys.path.insert(0, "/API")
 
 import time
-import board
-import digitalio
-import microcontroller
-import neopixel
 import gc
+import os
 import displayio
-from fourwire import FourWire
-from adafruit_st7789 import ST7789
-import terminalio
-from adafruit_display_text import label as _label
 
-from digital_io import DigitalInput, EdgeDetector
-from mario_model import MarioModel, InputState
-from mario_view  import MarioView
+from matrix_display import MatrixDisplay, WIDTH, HEIGHT
+from joystick import Joystick
+from buttons import ButtonSet
+from audio_out import AudioOutput
+from high_scores import HighScoreManager
+from base_game import BaseGame
+from games.view_utils import draw_tiny_text, draw_big_text, clear_bitmap, text_width_tiny
 
-Debug = True
-
-
-def _setup_display():
-    backlight           = digitalio.DigitalInOut(microcontroller.pin.PA06)
-    backlight.direction = digitalio.Direction.OUTPUT
-    backlight.value     = False
-
-    displayio.release_displays()
-
-    spi         = board.LCD_SPI()
-    display_bus = FourWire(spi, command=board.D4, chip_select=board.LCD_CS)
-    display     = ST7789(
-        display_bus,
-        rotation=90,
-        width=240, height=135,
-        rowstart=40, colstart=53,
-    )
-    print('Display OK')
-    return display
+TRANSITION_DURATION = 3.0
+GAME_OVER_DURATION = 5.0
 
 
-class JoystickController:
-    def __init__(self):
-        print('Initialising joystick and buttons...')
-        
-        self._joy_up = DigitalInput(board.D0, pull=digitalio.Pull.DOWN)
-        self._joy_down = DigitalInput(board.D1, pull=digitalio.Pull.DOWN)
-        self._joy_left = DigitalInput(board.D2, pull=digitalio.Pull.DOWN)
-        self._joy_right = DigitalInput(board.D9, pull=digitalio.Pull.DOWN)
-        
-        self._btn_a = EdgeDetector(board.D10, pull=digitalio.Pull.DOWN)
-        self._btn_b = EdgeDetector(board.D5, pull=digitalio.Pull.DOWN)
-        self._btn_c = EdgeDetector(board.D6, pull=digitalio.Pull.DOWN)
-        self._btn_d = EdgeDetector(board.D7, pull=digitalio.Pull.DOWN)
-        
-        self._buf_frames = 0
-        self._state = InputState()
-        
-        print('Joystick and buttons OK')
+def discover_games():
+    games = []
+    possible_paths = ["/games", "games", "./games"]
+    games_path = None
+    for path in possible_paths:
+        try:
+            entries = os.listdir(path)
+            games_path = path
+            print(f"Found games folder at: {path}")
+            break
+        except OSError:
+            continue
+    if games_path is None:
+        print("ERROR: games folder not found")
+        return games
+    print(f"Games folder contents: {entries}")
+    for name in entries:
+        if name.startswith(".") or name.startswith("_"):
+            continue
+        if name.endswith(".md") or name.endswith(".txt") or name.endswith(".py"):
+            continue
+        folder_path = f"{games_path}/{name}"
+        try:
+            stat_result = os.stat(folder_path)
+            is_dir = stat_result[0] & 0x4000
+            if not is_dir:
+                continue
+        except OSError as e:
+            print(f"  Cannot stat {folder_path}: {e}")
+            continue
+        init_path = f"{folder_path}/__init__.py"
+        try:
+            os.stat(init_path)
+        except OSError:
+            print(f"  Skipping {name}: no __init__.py")
+            continue
+        try:
+            print(f"  Importing games.{name}...")
+            module = __import__(f"games.{name}")
+            submodule = getattr(module, name)
+            for attr_name in dir(submodule):
+                attr = getattr(submodule, attr_name)
+                if (isinstance(attr, type) and
+                    issubclass(attr, BaseGame) and
+                    attr is not BaseGame):
+                    games.append(attr)
+                    print(f"  Loaded: {attr.NAME}")
+                    break
+        except Exception as e:
+            print(f"  Error loading {name}: {e}")
+    return games
 
-    def poll_button(self):
-        self._btn_a.update()
-        if self._btn_a.rose:
-            self._buf_frames = 3
 
-    def read(self):
-        self._btn_a.update()
-        self._btn_b.update()
-        self._btn_c.update()
-        self._btn_d.update()
-        
-        left = self._joy_left.value
-        right = self._joy_right.value
-        
-        if left and not right:
-            self._state.tilt_value = -1.0
-        elif right and not left:
-            self._state.tilt_value = 1.0
-        else:
-            self._state.tilt_value = 0.0
+def show_transition_screen(display, game_name):
+    """Show transition screen on 64x32 matrix."""
+    gc.collect()
 
-        if self._btn_a.rose:
-            self._buf_frames = 3
+    # Create bitmap for transition
+    bitmap = displayio.Bitmap(WIDTH, HEIGHT, 3)
+    palette = displayio.Palette(3)
+    palette[0] = 0x000020  # dark blue bg
+    palette[1] = 0xFFFFFF  # white text
+    palette[2] = 0x00FF00  # green text
 
-        if self._buf_frames > 0:
-            self._state.jump = True
-            self._buf_frames -= 1
-        else:
-            self._state.jump = False
+    # Fill background
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            bitmap[x, y] = 0
 
-        self._state.run = self._btn_b.value
+    # Draw "NEXT:" centered
+    text1 = "NEXT:"
+    text_w1 = text_width_tiny(text1)
+    x1 = (WIDTH - text_w1) // 2
+    draw_tiny_text(bitmap, text1, x1, 6, 1)
 
-        return self._state
+    # Draw game name centered (truncate if too long)
+    name_upper = game_name.upper()[:10]
+    text_w2 = text_width_tiny(name_upper)
+    x2 = (WIDTH - text_w2) // 2
+    draw_tiny_text(bitmap, name_upper, x2, 16, 2)
 
-
-def _show_startup_text(display, lines):
-    grp    = displayio.Group()
-    bg_bmp = displayio.Bitmap(240, 135, 1)
-    bg_pal = displayio.Palette(1)
-    bg_pal[0] = 0x000000
-    grp.append(displayio.TileGrid(bg_bmp, pixel_shader=bg_pal))
-
-    row_h   = 22
-    total_h = len(lines) * row_h
-    start_y = (135 - total_h) // 2 + row_h // 2
-
-    for i, text in enumerate(lines):
-        lbl = _label.Label(
-            terminalio.FONT,
-            text=text,
-            color=0xFFFFFF,
-            scale=2,
-            anchor_point=(0.5, 0.5),
-            anchored_position=(120, start_y + i * row_h),
-        )
-        grp.append(lbl)
-
+    # Set as display root
+    tg = displayio.TileGrid(bitmap, pixel_shader=palette)
+    grp = displayio.Group()
+    grp.append(tg)
     display.root_group = grp
+
+
+def show_game_over_screen(display, buttons, game_class):
+    """Show game-over screen on 64x32 matrix."""
+    gc.collect()
+
+    # Create bitmap for game over
+    bitmap = displayio.Bitmap(WIDTH, HEIGHT, 2)
+    palette = displayio.Palette(2)
+    palette[0] = 0x000000  # black bg
+    palette[1] = 0xFF0000  # red text
+
+    # Fill background
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            bitmap[x, y] = 0
+
+    # Draw "GAME OVER" centered using big font
+    draw_big_text(bitmap, "GAME", (WIDTH - 24) // 2, 4, 1)
+    draw_big_text(bitmap, "OVER", (WIDTH - 24) // 2, 18, 1)
+
+    # Set as display root
+    tg = displayio.TileGrid(bitmap, pixel_shader=palette)
+    grp = displayio.Group()
+    grp.append(tg)
+    display.root_group = grp
+
+    # Play game over sound if available
+    audio_obj = None
+    if game_class.GAME_OVER_SOUND:
+        try:
+            audio_obj = AudioOutput()
+            audio_obj.play_wav(game_class.GAME_OVER_SOUND)
+            print(f"Playing game over sound: {game_class.GAME_OVER_SOUND}")
+        except Exception as e:
+            print(f"Game over sound failed: {e}")
+
+    # Wait for duration or button press
+    start = time.monotonic()
+    while time.monotonic() - start < GAME_OVER_DURATION:
+        buttons.update()
+        if buttons.c_fell:  # Select = skip game over
+            print("Button C pressed")
+            break
+        if audio_obj and not audio_obj.is_playing:
+            time.sleep(1.0)
+            break
+        time.sleep(0.05)
+
+    if audio_obj:
+        try:
+            audio_obj.stop()
+            audio_obj.deinit()
+        except:
+            pass
+    gc.collect()
+
+
+def show_error(display, message):
+    """Show error message on 64x32 matrix."""
+    bitmap = displayio.Bitmap(WIDTH, HEIGHT, 2)
+    palette = displayio.Palette(2)
+    palette[0] = 0x400000  # dark red bg
+    palette[1] = 0xFFFFFF  # white text
+
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            bitmap[x, y] = 0
+
+    # Truncate message to fit
+    msg_upper = message.upper()[:16]
+    text_w = text_width_tiny(msg_upper)
+    x = (WIDTH - text_w) // 2
+    draw_tiny_text(bitmap, msg_upper, x, 13, 1)
+
+    tg = displayio.TileGrid(bitmap, pixel_shader=palette)
+    grp = displayio.Group()
+    grp.append(tg)
+    display.root_group = grp
+
+
+def clear_display(display):
+    try:
+        empty = displayio.Group()
+        display.root_group = empty
+    except:
+        pass
+    gc.collect()
 
 
 def main():
     gc.collect()
-    print('Free RAM at start: {} bytes'.format(gc.mem_free()))
+    print("=" * 50)
+    print("UNIFIED GAME LAUNCHER (RGB Matrix)")
+    print("=" * 50)
+    print(f"Free RAM: {gc.mem_free()} bytes")
 
-    display = _setup_display()
-    px      = neopixel.NeoPixel(board.NEOPIXEL, 5, brightness=0.15,
-                                auto_write=False)
-    px.fill(0x000000)
-    px.show()
+    print("\nInitializing hardware...")
+    matrix = MatrixDisplay()
+    joystick = Joystick()
+    buttons = ButtonSet()
+    high_scores = HighScoreManager()
 
-    _show_startup_text(display, [
-        'SUPER MARIO BROS',
-        'Joystick Edition',
-    ])
-    time.sleep(1)
+    print("\nDiscovering games...")
+    game_classes = discover_games()
+    if not game_classes:
+        print("ERROR: No games found!")
+        show_error(matrix.display, "No games")
+        while True:
+            time.sleep(1)
 
-    controller = JoystickController()
+    print(f"\nFound {len(game_classes)} game(s)")
 
-    model = MarioModel()
-    view  = MarioView(display, px)
-
-    print('\n' + '=' * 50)
-    print('SUPER MARIO BROS - JOYSTICK EDITION')
-    print('Joystick L/R = move | A = jump | B = run')
-    print('=' * 50 + '\n')
-
-    frame            = 0
-    gameover_holding = False
+    current_game_index = None
+    current_game = None
 
     while True:
-        controller.poll_button()
-        input_state = controller.read()
-        events = model.update(input_state)
+        current_game_index = 0 if current_game_index is None else (current_game_index + 1) % len(game_classes)
+        game_class = game_classes[current_game_index]
 
-        for event in events:
-            if event == 'jumped':
-                view.play_sfx('jump')
-            elif event == 'coin':
-                view.play_sfx('coin')
-            elif event == 'stomp':
-                pass
-            elif event == 'enemy_hit':
-                pass
-            elif event == 'gameover':
-                view.play_sfx('gameover')
-                view.show_game_over()
-                view.flash_neopixels_gameover()
-                gameover_holding = False
-            elif event == 'level_complete':
-                view.play_sfx('world_clear')
-                view.show_victory(model.score, model.coins)
-            elif event == 'level_reset':
-                view.hide_overlays()
+        clear_display(matrix.display)
+        gc.collect()
+        print(f"Pre-switch RAM: {gc.mem_free()} bytes")
+        print(f"\nSwitching to: {game_class.NAME}")
 
-        view.draw(model)
-        view.update_neopixels(model, model.level_complete)
+        show_transition_screen(matrix.display, game_class.NAME)
+        time.sleep(TRANSITION_DURATION)
 
-        frame += 1
+        clear_display(matrix.display)
+        gc.collect()
 
-        if frame % 90 == 0:
+        audio = AudioOutput()
+        gc.collect()
+
+        current_game = game_class(matrix, joystick, buttons, audio, high_scores)
+
+        try:
             gc.collect()
-            if Debug or frame % 180 == 0:
-                print('Score: {} | Coins: {} | Lives: {} | RAM: {}'.format(
-                    model.score, model.coins, model.lives, gc.mem_free()))
+            current_game.setup()
+        except Exception as e:
+            print(f"Setup error: {e}")
+            if current_game:
+                try:
+                    current_game.cleanup()
+                except:
+                    pass
+            try:
+                audio.deinit()
+            except:
+                pass
+            clear_display(matrix.display)
+            gc.collect()
+            continue
 
-        if model.game_over and not gameover_holding:
-            gameover_holding = True
-            print('\nGAME OVER!  Final score: {}'.format(model.score))
+        exit_reason = None
+        try:
+            exit_reason = current_game.run()
+        except Exception as e:
+            print(f"Runtime error: {e}")
+            exit_reason = "switch"
 
-            for i in range(150):
-                time.sleep(0.033)
-                if i % 30 == 0:
-                    if view.is_audio_playing():
-                        print('  gameover audio playing... ({}s)'.format(i // 30 + 1))
-                    else:
-                        print('  holding screen... ({}s)'.format(i // 30 + 1))
+        try:
+            current_game.cleanup()
+        except Exception as e:
+            print(f"Cleanup error: {e}")
 
-            print('Restarting level...\n')
-            view.stop_audio()
-            model.reset()
-            view.hide_overlays()
-            gameover_holding = False
+        try:
+            audio.deinit()
+        except:
+            pass
 
-        time.sleep(0.033)
+        current_game = None
+        clear_display(matrix.display)
+        gc.collect()
+        gc.collect()
+        print(f"Post-cleanup RAM: {gc.mem_free()} bytes")
+
+        if exit_reason == "gameover":
+            show_game_over_screen(matrix.display, buttons, game_class)
+            clear_display(matrix.display)
+            gc.collect()
+
+        print(f"Switched. Free RAM: {gc.mem_free()} bytes")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
