@@ -4,16 +4,16 @@ import time
 from digital_io import DigitalInput, EdgeDetector
 
 # Joystick - 3-bit encoded, active HIGH
-sig_a = DigitalInput(board.D0, pull=digitalio.Pull.DOWN)
-sig_b = DigitalInput(board.D1, pull=digitalio.Pull.DOWN)
-sig_c = DigitalInput(board.D2, pull=digitalio.Pull.DOWN)
-sig_d = DigitalInput(board.D9, pull=digitalio.Pull.DOWN)  # Added for Down-Right detection
+sig_a = DigitalInput(board.A5, pull=digitalio.Pull.DOWN)
+sig_b = DigitalInput(board.A4, pull=digitalio.Pull.DOWN)
+sig_c = DigitalInput(board.A3, pull=digitalio.Pull.DOWN)
+sig_d = DigitalInput(board.A2, pull=digitalio.Pull.DOWN)  # Added for Down-Right detection
 
 # Button with edge detection
-btn_a = EdgeDetector(board.D10, pull=digitalio.Pull.DOWN)
-btn_b = EdgeDetector(board.D5, pull=digitalio.Pull.DOWN)
-btn_c = EdgeDetector(board.D6, pull=digitalio.Pull.DOWN)
-btn_d = EdgeDetector(board.D7, pull=digitalio.Pull.DOWN)
+btn_a = EdgeDetector(board.A1, pull=digitalio.Pull.DOWN)
+btn_b = EdgeDetector(board.A0, pull=digitalio.Pull.DOWN)
+btn_c = EdgeDetector(board.D10, pull=digitalio.Pull.DOWN)
+btn_d = EdgeDetector(board.D9, pull=digitalio.Pull.DOWN)
 
 def get_joystick_direction():
     a = sig_a.value
@@ -22,9 +22,9 @@ def get_joystick_direction():
     d = sig_d.value  # Read the new signal for Down-Right
     # Decode from original trace analysis
     if a:
-        return "Up"
-    if b:
         return "Down"
+    if b:
+        return "Up"
     if c:
         return "Left"
     if d:

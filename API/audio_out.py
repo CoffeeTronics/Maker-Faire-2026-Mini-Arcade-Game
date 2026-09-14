@@ -3,38 +3,17 @@ audio_out.py — DAC & WAV Audio Output
 =======================================
 Board: Ruler Baseboard
 
-Provides two audio output modes:
-  1. **Sine tone** — generates a pure sine wave at a specified frequency
-     using the on-board DAC (board.DAC).
-  2. **WAV playback** — plays a mono 16-bit PCM WAV file (≤22 kHz) from the
-     CIRCUITPY filesystem or SD card.
+Provides audio output modes:
+  1. Sine tone — generates a pure sine wave at a specified frequency
+  2. WAV playback — plays mono 16-bit PCM WAV files (≤22 kHz)
+  3. Preloaded sounds — cache sounds for fast, non-blocking playback
 
-Hardware
---------
-  board.DAC  — dedicated audio DAC output pin (connect to audio amplifier or
-               speaker with coupling capacitor)
-  board.D3   — onboard user button (used as trigger in the original test)
-
-Requires
---------
-  audiocore (built-in), audioio (built-in)
-
-WAV file requirements
-----------------------
-  Mono, 16-bit PCM, 22 050 Hz or less.
-  Stereo files and compressed formats (MP3, AAC) are NOT supported.
-
-Use this module for:
-  - Sound effects in games
-  - Alert tones and notifications
-  - Voice / music playback from SD card
-  - Synthesised tones for musical instruments
+Hardware: board.DAC — dedicated audio DAC output pin
 """
 
 import array
 import math
 import board
-import digitalio
 import time
 from audiocore import RawSample, WaveFile
 
@@ -48,117 +27,115 @@ except ImportError:
 
 
 class AudioOutput:
-    """Play sine tones and WAV files through the board DAC.
-
-    Parameters
-    ----------
-    pin         : audio output pin (default board.DAC)
-
-    Example - Play happy birthday using generated tones
-    --------------
-import pykit_explorer
-from audio_out import AudioOutput
-audio = AudioOutput()
-# Happy Birthday note timings (frequency, duration in seconds)
-line1 = [(524, 0.15), (524, 0.15), (588, 0.3), (524, 0.3), (698, 0.3), (660, 0.6)]
-line2 = [(524, 0.15), (524, 0.15), (588, 0.3), (524, 0.3), (784, 0.3), (698, 0.6)]
-line3 = [(524, 0.3), (524, 0.3), (1046, 0.3), (880, 0.3), (698, 0.3), (660, 0.3), (588, 0.6)]
-line4 = [(932, 0.15), (932, 0.15), (880, 0.3), (698, 0.3), (784, 0.3), (698, 0.6)]
-happy_birthday = line1 + line2 + line3 + line4
-# Generate and play each note on-demand
-for frequency, duration in happy_birthday:
-    sample = audio._make_sine(frequency, volume=0.1)
-    audio._audio.play(sample, loop=True)
-    time.sleep(duration)
-audio.stop()
-
-
-    Example - Play WAV files
-    -------------
-import pykit_explorer
-from audio_out import AudioOutput
-audio = AudioOutput()
-audio.play_wav("AudioFiles/210.wav")
-time.sleep(0.5)
-audio.play_wav("AudioFiles/304.wav")
-time.sleep(0.5)
-audio.play_wav("AudioFiles/320.wav")
-time.sleep(0.5)
-audio.play_wav("AudioFiles/140.wav")
-
-    """
+    """Play sine tones and WAV files through the board DAC."""
 
     def __init__(self, pin=board.DAC):
         if AudioOut is None:
-            raise RuntimeError("No AudioOut or PWMAudioOut available on this board.")
+            raise RuntimeError("No AudioOut available on this board.")
         self._audio = AudioOut(pin)
         self._tone_sample = None
+        self._preloaded = {}  # name -> (file_handle, WaveFile)
+
+    # -- Preloaded sounds ----------------------------------------------------
+
+    def preload_wav(self, name, path):
+        """Preload a WAV file for fast non-blocking playback.
+
+        Parameters
+        ----------
+        name : str - identifier for this sound
+        path : str - path to WAV file
+
+        Example
+        -------
+        audio.preload_wav("shoot", "/AudioFiles/shoot.wav")
+        audio.preload_wav("explosion", "/AudioFiles/explosion.wav")
+        """
+        try:
+            if name in self._preloaded:
+                self.unload_wav(name)
+            fh = open(path, "rb")
+            wave = WaveFile(fh)
+            self._preloaded[name] = (fh, wave)
+        except Exception as e:
+            print(f"Failed to preload {name}: {e}")
+
+    def play_preloaded(self, name):
+        """Play a preloaded sound non-blocking.
+
+        Parameters
+        ----------
+        name : str - identifier used in preload_wav()
+
+        Returns True if sound started, False if not found/error.
+        """
+        if name not in self._preloaded:
+            print(f"Audio: {name} not in preloaded ({list(self._preloaded.keys())})")
+            return False
+        try:
+            fh, wave = self._preloaded[name]
+            # Seek back to start for replay
+            fh.seek(0)
+            wave = WaveFile(fh)
+            self._preloaded[name] = (fh, wave)
+            if self._audio.playing:
+                self._audio.stop()
+            self._audio.play(wave)
+            return True
+        except Exception as e:
+            print(f"Play error {name}: {e}")
+            return False
+
+    def unload_wav(self, name):
+        """Unload a preloaded sound to free memory."""
+        if name in self._preloaded:
+            try:
+                fh, wave = self._preloaded[name]
+                fh.close()
+            except:
+                pass
+            del self._preloaded[name]
+
+    def unload_all(self):
+        """Unload all preloaded sounds."""
+        for name in list(self._preloaded.keys()):
+            self.unload_wav(name)
 
     # -- Sine tone -----------------------------------------------------------
 
-    def _make_sine(self, frequency: int, volume: float = 0.1) -> RawSample:
-        """Build a RawSample buffer containing an integer number of sine cycles.
-
-        Uses GCD(sample_rate, frequency) to find the shortest buffer that holds
-        a whole number of complete cycles, so the loop point is always exact.
-
-        Example - 3000 Hz at 8000 Hz sample rate:
-            gcd(8000, 3000) = 1000  →  3 cycles in 8 samples  →  3000 Hz ✓
-            (the naive 8000 // 3000 = 2 samples produces two equal DC values
-            because sin(0) ≈ sin(π) ≈ 0, so the speaker never moves)
-        """
+    def _make_sine(self, frequency, volume=0.1):
         sample_rate = 8000
         a, b = sample_rate, frequency
         while b:
             a, b = b, a % b
         g = a
-        num_cycles = frequency // g        # complete sine cycles in the buffer
-        length     = sample_rate // g      # samples needed
+        num_cycles = frequency // g
+        length = sample_rate // g
         buf = array.array("H", [0] * length)
         for i in range(length):
             buf[i] = int((1 + math.sin(math.pi * 2 * num_cycles * i / length))
                          * volume * (2 ** 15 - 1))
         return RawSample(buf)
 
-    def play_tone(self, frequency: int = 1000, volume: float = 0.1,
-                  duration: float = None):
-        """Generate and play a sine wave tone.
-
-        Parameters
-        ----------
-        frequency : tone frequency in Hz (default 1000)
-        volume    : amplitude 0.0–1.0 (default 0.1 — DAC output is loud!)
-        duration  : seconds to play, then stop (default None = play until stop())
-        """
+    def play_tone(self, frequency=1000, volume=0.1, duration=None):
+        """Generate and play a sine wave tone."""
         sample = self._make_sine(frequency, volume)
         self._audio.play(sample, loop=True)
         if duration is not None:
             time.sleep(duration)
             self.stop()
 
-    def play_scale(self, notes: list = None, duration_each: float = 0.3,
-                   volume: float = 0.1):
-        """Play a list of frequencies in sequence (blocking).
-
-        Default plays a C-major scale.
-        """
+    def play_scale(self, notes=None, duration_each=0.3, volume=0.1):
+        """Play a list of frequencies in sequence (blocking)."""
         if notes is None:
-            notes = [262, 294, 330, 349, 392, 440, 494, 523]  # C4–C5
+            notes = [262, 294, 330, 349, 392, 440, 494, 523]
         for freq in notes:
             self.play_tone(freq, volume=volume, duration=duration_each)
 
     # -- WAV playback --------------------------------------------------------
 
-    def play_wav(self, path: str, loop: bool = False):
-        """Play a WAV file from the filesystem.
-
-        Parameters
-        ----------
-        path : path to WAV file, e.g. "AudioFiles/beep.wav"
-        loop : if True, loop the file continuously until stop() is called
-
-        Note: WAV must be mono, 16-bit PCM, ≤22 050 Hz.
-        """
+    def play_wav(self, path, loop=False):
+        """Play a WAV file (blocking unless loop=True)."""
         wave_file = open(path, "rb")
         wave = WaveFile(wave_file)
         self._audio.play(wave, loop=loop)
@@ -167,18 +144,16 @@ audio.play_wav("AudioFiles/140.wav")
                 pass
             wave_file.close()
 
-    def play_wav_list(self, paths: list, delay: float = 0.0):
-        """Play a list of WAV files in sequence (blocking).
-
-        Parameters
-        ----------
-        paths : list of file path strings
-        delay : seconds to pause between files
-        """
-        for path in paths:
-            self.play_wav(path, loop=False)
-            if delay:
-                time.sleep(delay)
+    def play_wav_async(self, path):
+        """Play a WAV file non-blocking. File closes when playback ends."""
+        try:
+            wave_file = open(path, "rb")
+            wave = WaveFile(wave_file)
+            if self._audio.playing:
+                self._audio.stop()
+            self._audio.play(wave)
+        except Exception as e:
+            print(f"play_wav_async error: {e}")
 
     # -- Control -------------------------------------------------------------
 
@@ -187,9 +162,12 @@ audio.play_wav("AudioFiles/140.wav")
         self._audio.stop()
 
     @property
-    def is_playing(self) -> bool:
+    def is_playing(self):
         """True while audio is currently playing."""
         return self._audio.playing
 
     def deinit(self):
+        """Release audio hardware and all preloaded sounds."""
+        self.stop()
+        self.unload_all()
         self._audio.deinit()
