@@ -116,8 +116,7 @@ class SnakeGame(BaseGame):
             return
 
         direction = self.joystick.get_direction()
-        if direction is not None or self.buttons.d_fell:  # Start button
-                    print("Button D pressed")
+        if direction is not None:
             self.model.set_direction(direction)
 
     def _save_score(self):
